@@ -219,3 +219,5 @@ __marimo__/
 
 # Model files
 *.h5
+
+.DS_Store
