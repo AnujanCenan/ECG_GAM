@@ -350,6 +350,7 @@ def run_cross_validation(reader, database_path, class_ids):
             'fold': fold_idx + 1,
             'best_val_f1': best_val_f1,
             'best_val_loss': best_val_loss,
+            'path': f'best_model_fold{fold_idx+1}.weights.h5'
         })
 
     print(f"\n{'='*50}")
@@ -360,7 +361,7 @@ def run_cross_validation(reader, database_path, class_ids):
     mean_f1 = np.mean([r['best_val_f1'] for r in fold_results])
     print(f"Mean Macro F1 across folds: {mean_f1:.4f}")
 
-    return test_df 
+    return test_df, fold_results
 
 
 
@@ -413,7 +414,6 @@ def evaluate_fold(model, signals, labels, masks, has_masks, confusion_matrix_fil
     return all_labels, all_preds, all_probs
 
 
-
 def evaluate_on_test_set(test_df, database_path, fold_model_paths, best_fold_idx):
     test_signals, test_labels, test_masks, test_has_masks = \
         preprocess_dataframe(test_df, database_path)
@@ -451,4 +451,15 @@ if __name__ == "__main__":
     class_ids = ptbxl_cond_to_ids()
 
     reader = PTB_XL_Reader(DATABASE_PATH)
-    results = run_cross_validation(reader, DATABASE_PATH, class_ids)
+    test_df, fold_results = run_cross_validation(reader, DATABASE_PATH, class_ids)
+    
+    # Has keys             
+        # 'fold'
+        # 'best_val_f1'
+        # 'best_val_loss'
+        # 'path'
+    best_fold = max(fold_results, key=lambda r: r['best_val_f1'])
+    fold_paths = [r['path'] for r in fold_results]
+        
+
+    evaluate_on_test_set(test_df, DATABASE_PATH, fold_paths, best_fold['fold'] - 1)
