@@ -10,11 +10,11 @@ from scipy.signal import butter, filtfilt, resample
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 from dotenv import load_dotenv
-import matplotlib as plt
+import matplotlib.pyplot as plt
 
-from gam import Attention_Maps, GSA
-from data_reader.data_reader import PTB_XL_Reader
-from data_organisation.ptbxl_organisation import ptbxl_cond_to_ids
+from src.gam import Attention_Maps, GSA
+from src.data_reader.data_reader import PTB_XL_Reader
+from src.data_organisation.ptbxl_organisation import ptbxl_cond_to_ids
 
 tf.get_logger().setLevel('ERROR')  # only shows ERROR and above
 
@@ -258,6 +258,16 @@ def compute_f1_per_class(all_labels, all_preds, num_classes=NUM_CLASSES):
         f1_scores.append(f1)
     return f1_scores
 
+# ========= SAVING TRAIN-VALIDATION-TEST INFO ============
+def save_split_info(test_df, fold_splits, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    test_df.to_csv(os.path.join(output_dir, 'test_set.csv'), index=False)
+    
+    for fold_idx, (train_df, val_df) in enumerate(fold_splits):
+        train_df.to_csv(os.path.join(output_dir, f'fold{fold_idx+1}_train.csv'), index=False)
+        val_df.to_csv(os.path.join(output_dir, f'fold{fold_idx+1}_val.csv'), index=False)
+
 # ======================== TRAINING LOOP ========================
 def run_cross_validation(reader, database_path, class_ids):
     df, test_df = load_and_filter_records(reader, class_ids)
@@ -266,6 +276,7 @@ def run_cross_validation(reader, database_path, class_ids):
     labels_array = df['label'].values
 
     fold_results = []
+    fold_splits = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(
         skf.split(np.zeros(len(df)), labels_array)
@@ -276,6 +287,8 @@ def run_cross_validation(reader, database_path, class_ids):
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df   = df.iloc[val_idx].reset_index(drop=True)
+        
+        fold_splits.append((train_df, val_df))
 
         print(f"Train size: {len(train_df)} | Val size: {len(val_df)}")
 
@@ -293,7 +306,7 @@ def run_cross_validation(reader, database_path, class_ids):
         val_dataset = make_dataset_from_arrays(
             val_signals, val_labels, val_masks, val_has_masks, shuffle=False
         )
-        # Fresh model and optimizer for each fold
+
         model = GSA()
         optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
 
@@ -344,6 +357,7 @@ def run_cross_validation(reader, database_path, class_ids):
                 best_val_f1   = macro_f1
                 best_val_loss = mean_val_loss
                 model.save_weights(f'best_model_fold{fold_idx+1}.weights.h5')
+                # model.save(f'best_model_fold{fold_idx+1}.keras')             # for retraining
                 print(f"  -> Saved best model (Macro F1: {best_val_f1:.4f})")
 
         fold_results.append({
@@ -352,6 +366,9 @@ def run_cross_validation(reader, database_path, class_ids):
             'best_val_loss': best_val_loss,
             'path': f'best_model_fold{fold_idx+1}.weights.h5'
         })
+    
+    save_split_info(test_df, fold_splits, output_dir='splits')
+
 
     print(f"\n{'='*50}")
     print("CROSS VALIDATION COMPLETE")
@@ -368,16 +385,25 @@ def run_cross_validation(reader, database_path, class_ids):
 # ================================= MODEL LOAD =================================
 
 def load_best_model(weights_path):
+    # 1. Clear session to avoid overlapping layer increment names
+    tf.keras.backend.clear_session()
+
+    # 2. Instantiate your custom model architecture
     model = GSA()
+
+    dummy_input = tf.zeros((1, SIGNAL_LENGTH, 12), dtype=tf.float32)
+    _ = model(dummy_input, training=False)
     
-    # Build the model by running a dummy forward pass
-    dummy_input = tf.zeros((1, SIGNAL_LENGTH, 12))
-    model(dummy_input)
-    
-    # Now load the saved weights
-    model.load_weights(weights_path)
-    
-    return model
+    # 4. Load weights by topology order instead of literal string names
+    try:
+        model.load_weights(weights_path, by_name=False)
+        print(f"Successfully loaded weights topologically from: {weights_path}")
+    except Exception as e:
+        print("Standard topological load failed. Attempting fallback mapping...")
+        # Fallback option: If structural tracking is nested inside an outer layer container
+        model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+        
+    return model 
 
 # ================================= TESTING SET ================================
 def evaluate_fold(model, signals, labels, masks, has_masks, confusion_matrix_file_name="confusion_matrix.png"):
@@ -409,7 +435,6 @@ def evaluate_fold(model, signals, labels, masks, has_masks, confusion_matrix_fil
     plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.savefig(confusion_matrix_file_name, dpi=150)
-    plt.show()
 
     return all_labels, all_preds, all_probs
 
