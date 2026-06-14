@@ -7,8 +7,10 @@ import ast
 import os
 
 from scipy.signal import butter, filtfilt, resample
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 from dotenv import load_dotenv
+import matplotlib as plt
 
 from gam import Attention_Maps, GSA
 from data_reader.data_reader import PTB_XL_Reader
@@ -115,7 +117,7 @@ def preprocess_dataframe(df, database_path):
 
 
 # ======================== DATASET PREPARATION ========================
-def load_and_filter_records(reader, class_ids):
+def load_and_filter_records(reader, class_ids, test_size=0.15):
     '''
     Loads full CSV, filters to class IDs, subsamples NORM,
     returns a dataframe with ecg_id, label, filename columns
@@ -151,11 +153,23 @@ def load_and_filter_records(reader, class_ids):
     other_df = df[df['label'] != 0]
     df = pd.concat([norm_df, other_df]).reset_index(drop=True)
 
-    print(f"Final class counts:")
-    for label, name in enumerate(['NORM', 'LBBB', 'RBBB', '1dAVB']):
-        print(f"  {name}: {len(df[df['label'] == label])}")
+    # Train-Test split
+    dev_df, test_df = train_test_split(
+        df, test_size=test_size, stratify=df['label'], random_state=42
+    )
+    dev_df  = dev_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
 
-    return df
+
+    print("Dev set class counts:")
+    for label, name in enumerate(['NORM', 'LBBB', 'RBBB', '1dAVB']):
+        print(f"  {name}: {len(dev_df[dev_df['label'] == label])}")
+
+    print("Test set class counts:")
+    for label, name in enumerate(['NORM', 'LBBB', 'RBBB', '1dAVB']):
+        print(f"  {name}: {len(test_df[test_df['label'] == label])}")
+
+    return dev_df, test_df
 
 def load_single_record(database_path, filename):
     record = wfdb.rdrecord(database_path + filename)
@@ -246,7 +260,7 @@ def compute_f1_per_class(all_labels, all_preds, num_classes=NUM_CLASSES):
 
 # ======================== TRAINING LOOP ========================
 def run_cross_validation(reader, database_path, class_ids):
-    df = load_and_filter_records(reader, class_ids)
+    df, test_df = load_and_filter_records(reader, class_ids)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     labels_array = df['label'].values
@@ -336,6 +350,7 @@ def run_cross_validation(reader, database_path, class_ids):
             'fold': fold_idx + 1,
             'best_val_f1': best_val_f1,
             'best_val_loss': best_val_loss,
+            'path': f'best_model_fold{fold_idx+1}.weights.h5'
         })
 
     print(f"\n{'='*50}")
@@ -346,8 +361,86 @@ def run_cross_validation(reader, database_path, class_ids):
     mean_f1 = np.mean([r['best_val_f1'] for r in fold_results])
     print(f"Mean Macro F1 across folds: {mean_f1:.4f}")
 
-    return fold_results
+    return test_df, fold_results
 
+
+
+# ================================= MODEL LOAD =================================
+
+def load_best_model(weights_path):
+    model = GSA()
+    
+    # Build the model by running a dummy forward pass
+    dummy_input = tf.zeros((1, SIGNAL_LENGTH, 12))
+    model(dummy_input)
+    
+    # Now load the saved weights
+    model.load_weights(weights_path)
+    
+    return model
+
+# ================================= TESTING SET ================================
+def evaluate_fold(model, signals, labels, masks, has_masks, confusion_matrix_file_name="confusion_matrix.png"):
+    dataset = make_dataset_from_arrays(signals, labels, masks, has_masks, shuffle=False)
+
+    all_labels = []
+    all_preds  = []
+    all_probs  = []
+
+    for batch_signals, batch_labels, _, _ in dataset:
+        pred_probs, _, _ = model(batch_signals, training=False)
+        preds = tf.argmax(pred_probs, axis=1).numpy()
+        all_preds.extend(preds)
+        all_labels.extend(batch_labels.numpy())
+        all_probs.extend(pred_probs.numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds  = np.array(all_preds)
+    all_probs  = np.array(all_probs)
+
+    class_names = ['NORM', 'LBBB', 'RBBB', '1dAVB']
+
+    print(classification_report(all_labels, all_preds, target_names=class_names))
+
+    cm = confusion_matrix(all_labels, all_preds)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp.plot(ax=ax, colorbar=False)
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(confusion_matrix_file_name, dpi=150)
+    plt.show()
+
+    return all_labels, all_preds, all_probs
+
+
+def evaluate_on_test_set(test_df, database_path, fold_model_paths, best_fold_idx):
+    test_signals, test_labels, test_masks, test_has_masks = \
+        preprocess_dataframe(test_df, database_path)
+
+    test_dataset = make_dataset_from_arrays(
+        test_signals, test_labels, test_masks, test_has_masks, shuffle=False
+    )
+
+    # Option A: evaluate the single best fold model
+    best_model = load_best_model(fold_model_paths[best_fold_idx])
+    evaluate_fold(best_model, test_signals, test_labels, test_masks, test_has_masks)
+
+    # Option B: ensemble all 5 fold models by averaging predictions
+    all_probs = []
+    for path in fold_model_paths:
+        model = load_best_model(path)
+        probs_list = []
+        for signals, labels, _, _ in test_dataset:
+            pred_probs, _, _ = model(signals, training=False)
+            probs_list.append(pred_probs.numpy())
+        all_probs.append(np.concatenate(probs_list, axis=0))
+
+    ensemble_probs = np.mean(all_probs, axis=0)
+    ensemble_preds = np.argmax(ensemble_probs, axis=1)
+
+    class_names = ['NORM', 'LBBB', 'RBBB', '1dAVB']
+    print(classification_report(test_labels, ensemble_preds, target_names=class_names))
 
 # ======================== ENTRY POINT ========================
 if __name__ == "__main__":
@@ -358,4 +451,15 @@ if __name__ == "__main__":
     class_ids = ptbxl_cond_to_ids()
 
     reader = PTB_XL_Reader(DATABASE_PATH)
-    results = run_cross_validation(reader, DATABASE_PATH, class_ids)
+    test_df, fold_results = run_cross_validation(reader, DATABASE_PATH, class_ids)
+    
+    # Has keys             
+        # 'fold'
+        # 'best_val_f1'
+        # 'best_val_loss'
+        # 'path'
+    best_fold = max(fold_results, key=lambda r: r['best_val_f1'])
+    fold_paths = [r['path'] for r in fold_results]
+        
+
+    evaluate_on_test_set(test_df, DATABASE_PATH, fold_paths, best_fold['fold'] - 1)
