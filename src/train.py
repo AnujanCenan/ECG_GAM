@@ -356,7 +356,7 @@ def run_cross_validation(reader, database_path, class_ids):
             if macro_f1 > best_val_f1:
                 best_val_f1   = macro_f1
                 best_val_loss = mean_val_loss
-                model.save_weights(f'best_model_fold{fold_idx+1}.weights.h5')
+                model.save_weights(f'best_model_fold{fold_idx+1}.weights.hdf5')
                 # model.save(f'best_model_fold{fold_idx+1}.keras')             # for retraining
                 print(f"  -> Saved best model (Macro F1: {best_val_f1:.4f})")
 
@@ -364,7 +364,7 @@ def run_cross_validation(reader, database_path, class_ids):
             'fold': fold_idx + 1,
             'best_val_f1': best_val_f1,
             'best_val_loss': best_val_loss,
-            'path': f'best_model_fold{fold_idx+1}.weights.h5'
+            'path': f'best_model_fold{fold_idx+1}.weights.hdf5'
         })
     
     save_split_info(test_df, fold_splits, output_dir='splits')
